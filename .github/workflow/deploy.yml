@@ -1,0 +1,123 @@
+name: Daily Production Deployment
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: koyeb-prod
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Install jq
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq
+
+      - name: Find Koyeb Service ID (by domain substring)
+        id: get-service
+        env:
+          KOYEB_TOKEN: ${{ secrets.KOYEB_TOKEN }}
+          APP_DOMAIN_SUBSTRING: voiceless-bison-progressivesol-94a61cca
+        run: |
+          SERVICE_DATA=$(curl -s -H "Authorization: Bearer $KOYEB_TOKEN" \
+            "https://app.koyeb.com/v1/services")
+
+          SERVICE_ID=$(echo "$SERVICE_DATA" | jq -r \
+            --arg s "$APP_DOMAIN_SUBSTRING" \
+            '.services[]
+              | select(.active_deployment.definition.routes[]?.path? | tostring | contains($s))
+              | .id' | head -n1)
+
+          # Fallback: first service (if you only have one)
+          if [ -z "$SERVICE_ID" ] || [ "$SERVICE_ID" = "null" ]; then
+            SERVICE_ID=$(echo "$SERVICE_DATA" | jq -r '.services[0].id // empty')
+          fi
+
+          if [ -z "$SERVICE_ID" ] || [ "$SERVICE_ID" = "null" ]; then
+            echo "Error: Could not find service"
+            exit 1
+          fi
+
+          echo "service_id=$SERVICE_ID" >> $GITHUB_OUTPUT
+          echo "Found service ID: $SERVICE_ID"
+
+      - name: Compare deployed SHA (Koyeb) vs latest SHA (GitHub)
+        id: compare
+        env:
+          KOYEB_TOKEN: ${{ secrets.KOYEB_TOKEN }}
+          SERVICE_ID: ${{ steps.get-service.outputs.service_id }}
+          GH_OWNER: ShahabAhmed56
+          GH_REPO: Hybrid-CNC
+          GH_BRANCH: main
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          # 1) Get service details (includes latest deployment id)
+          SERVICE=$(curl -s -H "Authorization: Bearer $KOYEB_TOKEN" \
+            "https://app.koyeb.com/v1/services/$SERVICE_ID")
+
+          # Try these in order (Koyeb can represent this slightly differently)
+          DEPLOYMENT_ID=$(echo "$SERVICE" | jq -r '.service.latest_deployment_id // .service.active_deployment_id // empty')
+
+          if [ -z "$DEPLOYMENT_ID" ] || [ "$DEPLOYMENT_ID" = "null" ]; then
+            echo "Could not find latest/active deployment id. Will redeploy to be safe."
+            echo "should_redeploy=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          DEPLOYMENT=$(curl -s -H "Authorization: Bearer $KOYEB_TOKEN" \
+            "https://app.koyeb.com/v1/deployments/$DEPLOYMENT_ID")
+
+          # Deployed SHA (may be empty for some services; handle safely)
+          DEPLOYED_SHA=$(echo "$DEPLOYMENT" | jq -r '.deployment.definition.git.sha // empty')
+
+          # Latest SHA on GitHub for branch
+          LATEST_SHA=$(curl -s \
+            -H "Authorization: Bearer $GITHUB_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$GH_OWNER/$GH_REPO/commits/$GH_BRANCH" \
+            | jq -r '.sha // empty')
+
+          echo "Koyeb deployed SHA: ${DEPLOYED_SHA:-<empty>}"
+          echo "GitHub latest SHA:  ${LATEST_SHA:-<empty>}"
+
+          # If Koyeb doesn't report a SHA, redeploy (safe default)
+          if [ -z "$DEPLOYED_SHA" ] || [ "$DEPLOYED_SHA" = "null" ]; then
+            echo "Koyeb SHA is empty -> redeploying to ensure latest code is running."
+            echo "should_redeploy=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          if [ -z "$LATEST_SHA" ] || [ "$LATEST_SHA" = "null" ]; then
+            echo "Could not read GitHub SHA -> redeploying to be safe."
+            echo "should_redeploy=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          if [ "$DEPLOYED_SHA" = "$LATEST_SHA" ]; then
+            echo "No new commit since last deployment -> skipping redeploy."
+            echo "should_redeploy=false" >> $GITHUB_OUTPUT
+          else
+            echo "New commit exists -> redeploy required."
+            echo "should_redeploy=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Redeploy Service (only if needed)
+        if: steps.compare.outputs.should_redeploy == 'true'
+        env:
+          KOYEB_TOKEN: ${{ secrets.KOYEB_TOKEN }}
+        run: |
+          curl -s -X POST \
+            -H "Authorization: Bearer $KOYEB_TOKEN" \
+            -H "Content-Type: application/json" \
+            "https://app.koyeb.com/v1/services/${{ steps.get-service.outputs.service_id }}/redeploy"
+
+          echo "✅ Redeploy triggered (new commit detected)."
+
+      - name: Skip message (no changes)
+        if: steps.compare.outputs.should_redeploy == 'false'
+        run: |
+          echo "✅ No changes detected. Redeploy skipped."
